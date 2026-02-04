@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx serve -l 3000)",
+      "Bash(timeout:*)",
+      "Bash(npx serve . -l 3000)",
+      "Bash(ping:*)",
+      "Bash(wmic path win32_VideoController get:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(wmic cpu get name,NumberOfCores,MaxClockSpeed)",
+      "Bash(dir:*)"
+    ]
+  }
+}

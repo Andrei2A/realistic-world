@@ -1,0 +1,1802 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Мой Майнкрафт RTX</title>
+    <style>
+        body { margin: 0; overflow: hidden; }
+        #instructions {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: white; font-family: Arial; font-size: 24px;
+            background: rgba(0,0,0,0.7); padding: 30px;
+            cursor: pointer; border-radius: 10px;
+            text-align: center;
+        }
+        #crosshair {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: white; font-size: 24px;
+            display: none; pointer-events: none;
+            text-shadow: 1px 1px 2px black;
+        }
+        #loading {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: white; font-family: Arial; font-size: 20px;
+        }
+        /* === НОВОЕ: Панель статистики === */
+        #stats {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.8);
+            color: #0f0;
+            padding: 10px 15px;
+            font: 12px monospace;
+            border-radius: 5px;
+            display: none;
+            z-index: 1000;
+        }
+        #stats .row { margin: 3px 0; }
+        #stats .val { color: #0ff; }
+    </style>
+</head>
+<body>
+    <div id="loading">Генерация мира...</div>
+    <div id="instructions" style="display:none">КЛИКНИ ЧТОБЫ ИГРАТЬ<br><small>WASD - ходить, ПРОБЕЛ - прыжок<br>ЛКМ - ломать, ПКМ - ставить, 1-5 - выбор блока</small></div>
+    <div id="hotbar" style="position:absolute;bottom:20px;left:50%;transform:translateX(-50%);display:none;">
+        <span class="slot selected" data-slot="0" style="background:#4a7c34;">Трава</span>
+        <span class="slot" data-slot="1" style="background:#6b4a2a;">Земля</span>
+        <span class="slot" data-slot="2" style="background:#7a7a7a;">Камень</span>
+        <span class="slot" data-slot="3" style="background:#3a2a1a;">Дерево</span>
+        <span class="slot" data-slot="4" style="background:#2a5a1a;">Листва</span>
+    </div>
+    <style>
+        .slot { padding: 10px 15px; margin: 0 5px; color: white; font-family: Arial; cursor: pointer; border: 3px solid transparent; border-radius: 5px; }
+        .slot.selected { border-color: white; }
+    </style>
+    <div id="crosshair">+</div>
+
+    <!-- НОВОЕ: Панель статистики -->
+    <div id="stats">
+        <div class="row">FPS: <span class="val" id="fpsVal">0</span></div>
+        <div class="row">GPU: <span class="val" id="gpuVal">...</span></div>
+        <div class="row">Bloom: <span class="val">ON</span></div>
+        <div class="row">Shadows: <span class="val">4096²</span></div>
+    </div>
+
+    <!-- === ИЗМЕНЕНО: ES6 Modules для Post-Processing === -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        // === ИМПОРТЫ ===
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+        let camera, scene, renderer;
+        let composer; // НОВОЕ: Post-processing composer
+
+        // ============================================================
+        // RTX-STYLE WATER SYSTEM - Render Targets для отражений
+        // ============================================================
+        let reflectionRT, refractionRT, reflectionCamera;
+        let waterMesh;
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+        let isLocked = false, yaw = 0, pitch = 0;
+        let velocityY = 0;
+        const GRAVITY = 25, JUMP_FORCE = 9;
+        const PLAYER_HEIGHT = 1.7;
+        const CAVE_DEPTH = 15;
+        let onGround = true;
+        const solidBlocks = new Set();
+        const originalSolidBlocks = new Set();
+        let prevTime = performance.now();
+
+        // FPS счётчик
+        let fpsFrames = 0, fpsTime = 0;
+
+        const worldBlocks = new Map();
+        const generatedBlocks = new Map();
+        const destroyedBlocks = new Set();
+        let selectedSlot = 0;
+        const blockTypes = ['grass', 'dirt', 'stone', 'bark', 'leaves'];
+        let highlightBox;
+        let targetBlock = null;
+        let targetFace = null;
+        const raycaster = new THREE.Raycaster();
+        raycaster.far = 12;
+
+        const particles = [];
+        const particleGeo = new THREE.BoxGeometry(0.15, 0.15, 0.15);
+        const decorations = new Map();
+
+        function createTexture(w, h, fn) {
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            fn(c.getContext('2d'), w, h);
+            const t = new THREE.CanvasTexture(c);
+            t.magFilter = THREE.NearestFilter;
+            t.minFilter = THREE.NearestFilter;
+            return t;
+        }
+
+        // ============================================================
+        // РЕАЛИСТИЧНЫЕ ТЕКСТУРЫ (как на скриншоте с шейдерами)
+        // ============================================================
+        const textures = {
+            // ТРАВА - тёмно-зелёная, детализированная
+            grass: () => createTexture(128, 128, (ctx, w, h) => {
+                // Базовый тёмно-зелёный цвет
+                ctx.fillStyle = '#2a4a1a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Слои травы с разной глубиной
+                for (let layer = 0; layer < 3; layer++) {
+                    const darkness = 0.7 + layer * 0.15;
+                    for (let i = 0; i < 800; i++) {
+                        const x = Math.random() * w;
+                        const y = Math.random() * h;
+                        const green = Math.floor(40 + Math.random() * 60 * darkness);
+                        const r = Math.floor(green * 0.4);
+                        const b = Math.floor(green * 0.2);
+                        ctx.fillStyle = `rgb(${r}, ${green}, ${b})`;
+                        ctx.fillRect(x, y, 1 + Math.random() * 2, 1 + Math.random() * 3);
+                    }
+                }
+
+                // Тёмные пятна глубины
+                for (let i = 0; i < 50; i++) {
+                    ctx.fillStyle = `rgba(10, 30, 5, ${0.2 + Math.random() * 0.3})`;
+                    ctx.beginPath();
+                    ctx.arc(Math.random() * w, Math.random() * h, 2 + Math.random() * 5, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                // Светлые травинки
+                for (let i = 0; i < 200; i++) {
+                    ctx.strokeStyle = `rgba(80, 140, 40, ${0.3 + Math.random() * 0.4})`;
+                    ctx.lineWidth = 0.5;
+                    ctx.beginPath();
+                    const x = Math.random() * w;
+                    const y = Math.random() * h;
+                    ctx.moveTo(x, y);
+                    ctx.lineTo(x + (Math.random() - 0.5) * 3, y - 2 - Math.random() * 4);
+                    ctx.stroke();
+                }
+            }),
+            // ЗЕМЛЯ - тёмная, влажная
+            dirt: () => createTexture(128, 128, (ctx, w, h) => {
+                ctx.fillStyle = '#3a2a1a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Слои земли
+                for (let i = 0; i < 600; i++) {
+                    const shade = Math.random();
+                    const r = 40 + Math.floor(shade * 30);
+                    const g = 25 + Math.floor(shade * 20);
+                    const b = 10 + Math.floor(shade * 15);
+                    ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+                    ctx.fillRect(Math.random()*w, Math.random()*h, 2 + Math.random()*5, 2 + Math.random()*5);
+                }
+
+                // Камешки
+                for (let i = 0; i < 30; i++) {
+                    ctx.fillStyle = `rgba(100, 90, 70, ${0.3 + Math.random() * 0.4})`;
+                    ctx.beginPath();
+                    ctx.ellipse(Math.random()*w, Math.random()*h, 1+Math.random()*3, 1+Math.random()*2, Math.random()*Math.PI, 0, Math.PI*2);
+                    ctx.fill();
+                }
+
+                // Корни
+                ctx.strokeStyle = 'rgba(60, 40, 20, 0.5)';
+                ctx.lineWidth = 1;
+                for (let i = 0; i < 10; i++) {
+                    ctx.beginPath();
+                    ctx.moveTo(Math.random()*w, Math.random()*h);
+                    ctx.quadraticCurveTo(Math.random()*w, Math.random()*h, Math.random()*w, Math.random()*h);
+                    ctx.stroke();
+                }
+            }),
+
+            // КОРА - тёмная, глубокие борозды, как на картинке
+            bark: () => createTexture(128, 128, (ctx, w, h) => {
+                // Очень тёмный базовый цвет
+                ctx.fillStyle = '#1a1510';
+                ctx.fillRect(0, 0, w, h);
+
+                // Вертикальные борозды коры
+                for (let x = 0; x < w; x += 3 + Math.random() * 5) {
+                    const grooveWidth = 2 + Math.random() * 4;
+
+                    // Тёмная борозда
+                    ctx.fillStyle = `rgba(10, 8, 5, ${0.6 + Math.random() * 0.4})`;
+                    ctx.fillRect(x, 0, grooveWidth, h);
+
+                    // Выступающая часть коры (светлее)
+                    const ridgeX = x + grooveWidth;
+                    const ridgeWidth = 1 + Math.random() * 3;
+                    for (let y = 0; y < h; y += 2) {
+                        const brightness = 30 + Math.random() * 40;
+                        ctx.fillStyle = `rgb(${brightness}, ${brightness * 0.7}, ${brightness * 0.4})`;
+                        ctx.fillRect(ridgeX, y, ridgeWidth, 1 + Math.random() * 3);
+                    }
+                }
+
+                // Горизонтальные трещины
+                for (let i = 0; i < 15; i++) {
+                    const y = Math.random() * h;
+                    ctx.strokeStyle = `rgba(5, 3, 0, ${0.5 + Math.random() * 0.5})`;
+                    ctx.lineWidth = 1 + Math.random() * 2;
+                    ctx.beginPath();
+                    ctx.moveTo(0, y);
+                    for (let x = 0; x < w; x += 5) {
+                        ctx.lineTo(x, y + (Math.random() - 0.5) * 4);
+                    }
+                    ctx.stroke();
+                }
+
+                // Мох (зелёные пятна как на картинке)
+                for (let i = 0; i < 25; i++) {
+                    const x = Math.random() * w;
+                    const y = Math.random() * h;
+                    ctx.fillStyle = `rgba(30, 50, 20, ${0.3 + Math.random() * 0.4})`;
+                    ctx.beginPath();
+                    ctx.arc(x, y, 2 + Math.random() * 5, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                // Блики от влаги
+                for (let i = 0; i < 20; i++) {
+                    ctx.fillStyle = `rgba(80, 60, 40, ${0.1 + Math.random() * 0.2})`;
+                    ctx.fillRect(Math.random() * w, Math.random() * h, 1, 2 + Math.random() * 4);
+                }
+            }),
+
+            // Торец бревна
+            logEnd: () => createTexture(128, 128, (ctx, w, h) => {
+                ctx.fillStyle = '#4a3520';
+                ctx.fillRect(0, 0, w, h);
+                const cx = w/2, cy = h/2;
+
+                // Годовые кольца
+                for (let r = 3; r < w/2 - 2; r += 1.5) {
+                    const darkness = 0.3 + (r / (w/2)) * 0.4;
+                    ctx.strokeStyle = `rgba(${80 * darkness}, ${50 * darkness}, ${30 * darkness}, 0.8)`;
+                    ctx.lineWidth = 0.8 + Math.random() * 0.5;
+                    ctx.beginPath();
+                    ctx.arc(cx + (Math.random()-0.5)*2, cy + (Math.random()-0.5)*2, r, 0, Math.PI*2);
+                    ctx.stroke();
+                }
+
+                // Трещины от центра
+                ctx.strokeStyle = '#1a1008';
+                ctx.lineWidth = 2;
+                for (let i = 0; i < 4; i++) {
+                    ctx.beginPath();
+                    ctx.moveTo(cx, cy);
+                    const angle = (i / 4) * Math.PI * 2 + Math.random() * 0.5;
+                    const len = w/3 + Math.random() * w/4;
+                    ctx.lineTo(cx + Math.cos(angle)*len, cy + Math.sin(angle)*len);
+                    ctx.stroke();
+                }
+            }),
+
+            // ЛИСТВА - тёмно-зелёная, густая, глубокая
+            leaves: () => createTexture(128, 128, (ctx, w, h) => {
+                // Очень тёмный базовый
+                ctx.fillStyle = '#0a2008';
+                ctx.fillRect(0, 0, w, h);
+
+                // Множество слоёв листьев с разной глубиной
+                for (let layer = 0; layer < 5; layer++) {
+                    const brightness = 0.3 + layer * 0.15;
+                    const count = 150 - layer * 20;
+
+                    for (let i = 0; i < count; i++) {
+                        const x = Math.random() * w;
+                        const y = Math.random() * h;
+                        const size = 2 + Math.random() * 4;
+
+                        const g = Math.floor(40 + Math.random() * 50 * brightness);
+                        const r = Math.floor(g * 0.3);
+                        const b = Math.floor(g * 0.2);
+
+                        ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+                        ctx.beginPath();
+                        ctx.ellipse(x, y, size, size * 0.5, Math.random() * Math.PI, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+
+                // Глубокие тени между листьями
+                for (let i = 0; i < 100; i++) {
+                    ctx.fillStyle = `rgba(0, 10, 0, ${0.3 + Math.random() * 0.4})`;
+                    ctx.beginPath();
+                    ctx.arc(Math.random() * w, Math.random() * h, 1 + Math.random() * 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                // Светлые листочки (просвет)
+                for (let i = 0; i < 50; i++) {
+                    ctx.fillStyle = `rgba(60, 100, 30, ${0.3 + Math.random() * 0.3})`;
+                    const x = Math.random() * w;
+                    const y = Math.random() * h;
+                    ctx.beginPath();
+                    ctx.ellipse(x, y, 2 + Math.random() * 3, 1 + Math.random() * 2, Math.random() * Math.PI, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                // Прожилки
+                ctx.strokeStyle = 'rgba(20, 40, 10, 0.3)';
+                ctx.lineWidth = 0.5;
+                for (let i = 0; i < 30; i++) {
+                    ctx.beginPath();
+                    ctx.moveTo(Math.random() * w, Math.random() * h);
+                    ctx.lineTo(Math.random() * w, Math.random() * h);
+                    ctx.stroke();
+                }
+            }),
+
+            // КАМЕНЬ - серый с вариациями
+            stone: () => createTexture(128, 128, (ctx, w, h) => {
+                ctx.fillStyle = '#4a4a4a';
+                ctx.fillRect(0, 0, w, h);
+
+                // Слои камня
+                for (let i = 0; i < 400; i++) {
+                    const shade = 40 + Math.random() * 50;
+                    ctx.fillStyle = `rgb(${shade}, ${shade}, ${shade * 0.95})`;
+                    ctx.fillRect(Math.random()*w, Math.random()*h, 2+Math.random()*6, 2+Math.random()*6);
+                }
+
+                // Трещины
+                ctx.strokeStyle = 'rgba(20, 20, 20, 0.6)';
+                ctx.lineWidth = 1.5;
+                for (let i = 0; i < 12; i++) {
+                    ctx.beginPath();
+                    ctx.moveTo(Math.random()*w, Math.random()*h);
+                    ctx.quadraticCurveTo(Math.random()*w, Math.random()*h, Math.random()*w, Math.random()*h);
+                    ctx.stroke();
+                }
+
+                // Светлые минералы
+                for (let i = 0; i < 20; i++) {
+                    ctx.fillStyle = `rgba(120, 120, 110, ${0.3 + Math.random() * 0.3})`;
+                    ctx.fillRect(Math.random()*w, Math.random()*h, 1+Math.random()*2, 1+Math.random()*2);
+                }
+            }),
+            water: () => createTexture(128, 128, (ctx, w, h) => {
+                const grad = ctx.createLinearGradient(0, 0, w, h);
+                grad.addColorStop(0, '#4a90b0');
+                grad.addColorStop(0.5, '#5aa0c0');
+                grad.addColorStop(1, '#3a80a0');
+                ctx.fillStyle = grad;
+                ctx.fillRect(0, 0, w, h);
+                ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+                for (let i = 0; i < 50; i++) {
+                    ctx.beginPath();
+                    ctx.moveTo(0, Math.random()*h);
+                    ctx.bezierCurveTo(w*0.3, Math.random()*h, w*0.6, Math.random()*h, w, Math.random()*h);
+                    ctx.stroke();
+                }
+            }),
+            sand: () => createTexture(64, 64, (ctx, w, h) => {
+                ctx.fillStyle = '#d4c0a0';
+                ctx.fillRect(0, 0, w, h);
+                for (let i = 0; i < 400; i++) {
+                    ctx.fillStyle = ['#e4d0b0', '#c4b090', '#f4e0c0', '#b4a080'][Math.floor(Math.random()*4)];
+                    ctx.fillRect(Math.random()*w, Math.random()*h, 1, 1);
+                }
+                for (let i = 0; i < 10; i++) {
+                    ctx.fillStyle = '#a09070';
+                    ctx.beginPath();
+                    ctx.arc(Math.random()*w, Math.random()*h, 1+Math.random(), 0, Math.PI*2);
+                    ctx.fill();
+                }
+            })
+        };
+
+        // === НОВОЕ: Проверка GPU ===
+        function checkGPU() {
+            const gl = renderer.getContext();
+            const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+            if (debugInfo) {
+                const gpu = gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL);
+                document.getElementById('gpuVal').textContent = gpu.substring(0, 30) + '...';
+                console.log('🎮 GPU:', gpu);
+                if (gpu.includes('Intel')) {
+                    console.warn('⚠️ Встроенная графика! Включи RTX в NVIDIA Control Panel');
+                }
+            }
+        }
+
+        // === RTX-STYLE POST-PROCESSING ===
+        function initPostProcessing() {
+            composer = new EffectComposer(renderer);
+            composer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            composer.setSize(innerWidth, innerHeight);
+
+            // 1. Render Pass
+            const renderPass = new RenderPass(scene, camera);
+            composer.addPass(renderPass);
+
+            // 2. Bloom (умеренный для RTX-эффекта)
+            const bloomPass = new UnrealBloomPass(
+                new THREE.Vector2(innerWidth, innerHeight),
+                0.35,  // strength - умеренно
+                0.4,   // radius
+                0.85   // threshold - только яркое
+            );
+            composer.addPass(bloomPass);
+
+            // God Rays отключены - слишком агрессивные
+
+            // 3. Output Pass
+            const outputPass = new OutputPass();
+            composer.addPass(outputPass);
+
+            console.log('✅ Post-processing: Bloom');
+        }
+
+        function init() {
+            scene = new THREE.Scene();
+
+            // ============================================================
+            // АТМОСФЕРНОЕ НЕБО (как на картинке - тёплые тона на горизонте)
+            // ============================================================
+            const skyGeo = new THREE.SphereGeometry(400, 32, 32);
+            const skyMat = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 }
+                },
+                vertexShader: `
+                    varying vec3 vWorldPosition;
+                    void main() {
+                        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+                        vWorldPosition = worldPosition.xyz;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    uniform float uTime;
+                    varying vec3 vWorldPosition;
+
+                    void main() {
+                        vec3 dir = normalize(vWorldPosition);
+                        float h = dir.y;
+
+                        // Цвета неба (атмосферные, как на картинке)
+                        vec3 zenith = vec3(0.35, 0.5, 0.7);      // Тёмно-голубой зенит
+                        vec3 horizon = vec3(0.75, 0.7, 0.65);    // Тёплый горизонт
+                        vec3 ground = vec3(0.4, 0.45, 0.4);      // Зеленоватый низ
+
+                        vec3 color;
+                        if (h > 0.0) {
+                            // Небо
+                            float t = pow(h, 0.4);
+                            color = mix(horizon, zenith, t);
+
+                            // Золотистое свечение у горизонта
+                            float glowFactor = exp(-h * 5.0);
+                            vec3 glow = vec3(1.0, 0.85, 0.6);
+                            color = mix(color, glow, glowFactor * 0.4);
+                        } else {
+                            // Под горизонтом
+                            color = mix(horizon, ground, min(-h * 2.0, 1.0));
+                        }
+
+                        gl_FragColor = vec4(color, 1.0);
+                    }
+                `,
+                side: THREE.BackSide
+            });
+            scene.add(new THREE.Mesh(skyGeo, skyMat));
+
+            // ============================================================
+            // ОБЪЁМНЫЕ ОБЛАКА (как на картинке)
+            // ============================================================
+            const cloudGeo = new THREE.PlaneGeometry(1000, 1000);
+            const cloudMat = new THREE.MeshBasicMaterial({
+                map: createTexture(512, 512, (ctx, w, h) => {
+                    ctx.fillStyle = 'transparent';
+                    ctx.clearRect(0, 0, w, h);
+
+                    // Большие пушистые облака
+                    for (let i = 0; i < 80; i++) {
+                        const x = Math.random() * w;
+                        const y = Math.random() * h;
+                        const r = 30 + Math.random() * 60;
+
+                        // Тёмная нижняя часть облака
+                        const grad = ctx.createRadialGradient(x, y + r*0.3, 0, x, y, r);
+                        grad.addColorStop(0, 'rgba(220, 215, 200, 0.9)');
+                        grad.addColorStop(0.5, 'rgba(180, 175, 165, 0.5)');
+                        grad.addColorStop(1, 'rgba(150, 145, 140, 0)');
+                        ctx.fillStyle = grad;
+                        ctx.beginPath();
+                        ctx.arc(x, y, r, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    // Светлые верхушки
+                    for (let i = 0; i < 40; i++) {
+                        const x = Math.random() * w;
+                        const y = Math.random() * h;
+                        const r = 15 + Math.random() * 30;
+                        const grad = ctx.createRadialGradient(x, y, 0, x, y, r);
+                        grad.addColorStop(0, 'rgba(255, 250, 240, 0.8)');
+                        grad.addColorStop(1, 'rgba(255, 250, 240, 0)');
+                        ctx.fillStyle = grad;
+                        ctx.beginPath();
+                        ctx.arc(x, y, r, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }),
+                transparent: true,
+                opacity: 0.7,
+                depthWrite: false
+            });
+            const clouds = new THREE.Mesh(cloudGeo, cloudMat);
+            clouds.rotation.x = -Math.PI / 2;
+            clouds.position.y = 80;
+            scene.add(clouds);
+
+            // ============================================================
+            // АТМОСФЕРНЫЙ ТУМАН (зеленоватый, глубокий)
+            // ============================================================
+            scene.fog = new THREE.FogExp2(0x8a9a7a, 0.012);
+
+            camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 800);
+            camera.position.set(0, 2 + PLAYER_HEIGHT, 0);
+
+            // ============================================================
+            // RTX-OPTIMIZED RENDERER (для NVIDIA RTX 4000 Ada)
+            // ============================================================
+            renderer = new THREE.WebGLRenderer({
+                antialias: true,
+                powerPreference: "high-performance",  // Форсируем дискретную GPU
+                precision: "highp",                   // Максимальная точность
+                alpha: false,                         // Без прозрачности = быстрее
+                stencil: false                        // Не используем stencil
+            });
+
+            // Полное разрешение для RTX
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setSize(innerWidth, innerHeight);
+
+            // Тени высокого качества
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            renderer.shadowMap.autoUpdate = true;
+
+            // HDR Tone Mapping (как в RTX играх)
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.0;
+            renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+            document.body.appendChild(renderer.domElement);
+
+            // Проверка GPU
+            checkGPU();
+
+            // ============================================================
+            // RTX-STYLE: Render Targets (высокое разрешение для RTX)
+            // ============================================================
+            const rtSize = Math.min(window.innerWidth * window.devicePixelRatio, 2048); // Высокое качество для RTX
+            reflectionRT = new THREE.WebGLRenderTarget(rtSize, rtSize, {
+                minFilter: THREE.LinearFilter,
+                magFilter: THREE.LinearFilter,
+                format: THREE.RGBAFormat,
+                colorSpace: THREE.SRGBColorSpace
+            });
+            refractionRT = new THREE.WebGLRenderTarget(rtSize, rtSize, {
+                minFilter: THREE.LinearFilter,
+                magFilter: THREE.LinearFilter,
+                format: THREE.RGBAFormat,
+                colorSpace: THREE.SRGBColorSpace
+            });
+            reflectionCamera = camera.clone();
+
+            // ============================================================
+            // АТМОСФЕРНОЕ ОСВЕЩЕНИЕ (как на картинке)
+            // ============================================================
+
+            // Общий ambient - тёмный, зеленоватый (лесной)
+            scene.add(new THREE.AmbientLight(0x304020, 0.3));
+
+            // Hemisphere - небо vs земля
+            const hemi = new THREE.HemisphereLight(
+                0x8090a0,  // Небо (голубовато-серый)
+                0x203010,  // Земля (тёмно-зелёный)
+                0.6
+            );
+            scene.add(hemi);
+
+            // Rim light - тёплый контровой свет (как на картинке)
+            const rimLight = new THREE.DirectionalLight(0xffddaa, 0.8);
+            rimLight.position.set(-150, 30, -100);
+            scene.add(rimLight);
+
+            // Fill light - мягкий заполняющий
+            const fillLight = new THREE.DirectionalLight(0x90a0b0, 0.3);
+            fillLight.position.set(100, 20, 50);
+            scene.add(fillLight);
+
+            // Player light - слабее, теплее
+            const playerLight = new THREE.PointLight(0xffaa66, 1.5, 15);
+            playerLight.position.set(0, -0.5, 0);
+            camera.add(playerLight);
+            scene.add(camera);
+
+            // ============================================================
+            // СОЛНЦЕ (атмосферное, низкое - как на картинке)
+            // ============================================================
+            const sun = new THREE.DirectionalLight(0xffeedd, 2.0);
+            sun.position.set(250, 40, 200); // Низко над горизонтом
+            sun.castShadow = true;
+            sun.shadow.mapSize.set(4096, 4096);
+            sun.shadow.camera.near = 10;
+            sun.shadow.camera.far = 600;
+            sun.shadow.camera.left = -250;
+            sun.shadow.camera.right = 250;
+            sun.shadow.camera.top = 250;
+            sun.shadow.camera.bottom = -250;
+            sun.shadow.bias = -0.0003;
+            sun.shadow.normalBias = 0.03;
+            scene.add(sun);
+
+            // Визуальное солнце (тёплое, для Bloom)
+            const sunSphere = new THREE.Mesh(
+                new THREE.SphereGeometry(20, 32, 32),
+                new THREE.MeshBasicMaterial({ color: 0xffffcc })
+            );
+            sunSphere.position.copy(sun.position);
+            scene.add(sunSphere);
+
+            // Солнечные лучи (god rays эффект)
+            const rayGeo = new THREE.ConeGeometry(150, 300, 32, 1, true);
+            const rayMat = new THREE.MeshBasicMaterial({
+                color: 0xffffee,
+                transparent: true,
+                opacity: 0.03,
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+            const sunRays = new THREE.Mesh(rayGeo, rayMat);
+            sunRays.position.copy(sun.position);
+            sunRays.rotation.x = Math.PI;
+            scene.add(sunRays);
+
+            // === ИНИЦИАЛИЗАЦИЯ POST-PROCESSING ===
+            initPostProcessing();
+
+            createWorld();
+
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('instructions').style.display = 'block';
+
+            document.addEventListener('click', () => !isLocked && document.body.requestPointerLock());
+            document.addEventListener('pointerlockchange', () => {
+                isLocked = document.pointerLockElement === document.body;
+                document.getElementById('instructions').style.display = isLocked ? 'none' : 'block';
+                document.getElementById('crosshair').style.display = isLocked ? 'block' : 'none';
+                document.getElementById('hotbar').style.display = isLocked ? 'flex' : 'none';
+                document.getElementById('stats').style.display = isLocked ? 'block' : 'none';
+            });
+            document.addEventListener('mousemove', e => {
+                if (!isLocked) return;
+                yaw -= e.movementX * 0.002;
+                pitch = Math.max(-1.5, Math.min(1.5, pitch - e.movementY * 0.002));
+                camera.rotation.order = 'YXZ';
+                camera.rotation.y = yaw;
+                camera.rotation.x = pitch;
+            });
+            document.addEventListener('keydown', e => {
+                if (e.code === 'KeyW') moveForward = true;
+                if (e.code === 'KeyS') moveBackward = true;
+                if (e.code === 'KeyA') moveLeft = true;
+                if (e.code === 'KeyD') moveRight = true;
+                if (e.code === 'Space' && onGround) { velocityY = JUMP_FORCE; onGround = false; }
+            });
+            document.addEventListener('keyup', e => {
+                if (e.code === 'KeyW') moveForward = false;
+                if (e.code === 'KeyS') moveBackward = false;
+                if (e.code === 'KeyA') moveLeft = false;
+                if (e.code === 'KeyD') moveRight = false;
+            });
+            addEventListener('resize', () => {
+                camera.aspect = innerWidth / innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(innerWidth, innerHeight);
+                // НОВОЕ: Обновляем composer при resize
+                composer.setSize(innerWidth, innerHeight);
+            });
+
+            const highlightGeo = new THREE.BoxGeometry(1.02, 1.02, 1.02);
+            const highlightMat = new THREE.MeshBasicMaterial({
+                color: 0x000000,
+                transparent: true,
+                opacity: 0.2,
+                wireframe: true
+            });
+            highlightBox = new THREE.Mesh(highlightGeo, highlightMat);
+            highlightBox.visible = false;
+            scene.add(highlightBox);
+
+            document.addEventListener('keydown', e => {
+                if (e.key >= '1' && e.key <= '5') {
+                    selectedSlot = parseInt(e.key) - 1;
+                    document.querySelectorAll('.slot').forEach((s, i) => {
+                        s.classList.toggle('selected', i === selectedSlot);
+                    });
+                }
+            });
+
+            document.addEventListener('mousedown', e => {
+                if (!isLocked) return;
+                e.preventDefault();
+
+                if (e.button === 0 && targetBlock) {
+                    destroyBlock(targetBlock.x, targetBlock.y, targetBlock.z, targetBlock.blockType);
+                } else if (e.button === 2 && targetBlock && targetFace) {
+                    const newPos = {
+                        x: targetBlock.x + targetFace.x,
+                        y: targetBlock.y + targetFace.y,
+                        z: targetBlock.z + targetFace.z
+                    };
+                    const px = Math.floor(camera.position.x);
+                    const pz = Math.floor(camera.position.z);
+                    const py1 = Math.floor(camera.position.y - 1.5);
+                    const py2 = Math.floor(camera.position.y - 0.5);
+                    if (!((newPos.x === px && newPos.z === pz) && (newPos.y === py1 || newPos.y === py2))) {
+                        placeBlock(newPos.x, newPos.y, newPos.z, blockTypes[selectedSlot]);
+                    }
+                }
+            });
+
+            document.addEventListener('contextmenu', e => e.preventDefault());
+        }
+
+        function blockKey(x, z) { return x + ',' + z; }
+
+        function createWorld() {
+            const SIZE = 80;
+            const geo = new THREE.BoxGeometry(1, 1, 1);
+
+            const mats = {
+                grass: new THREE.MeshStandardMaterial({ map: textures.grass(), roughness: 0.9 }),
+                dirt: new THREE.MeshStandardMaterial({ map: textures.dirt(), roughness: 1 }),
+                bark: new THREE.MeshStandardMaterial({ map: textures.bark(), roughness: 0.8 }),
+                leaves: new THREE.MeshStandardMaterial({ map: textures.leaves(), roughness: 0.7, side: THREE.DoubleSide }),
+                stone: new THREE.MeshStandardMaterial({ map: textures.stone(), roughness: 0.9 })
+            };
+
+            const blocks = { grass: [], dirt: [], bark: [], leaves: [], stone: [], sand: [] };
+
+            const LAKE_X = 30, LAKE_Z = -20, LAKE_RADIUS = 15;
+
+            const caveTunnels = [];
+            for (let t = 0; t < 25; t++) {
+                const tunnel = [];
+                let tx = Math.random() * SIZE * 1.5 - SIZE * 0.75;
+                let ty = -3 - Math.random() * 8;
+                let tz = Math.random() * SIZE * 1.5 - SIZE * 0.75;
+                let dx = (Math.random() - 0.5) * 0.8;
+                let dy = (Math.random() - 0.5) * 0.3;
+                let dz = (Math.random() - 0.5) * 0.8;
+
+                const length = 30 + Math.random() * 60;
+                for (let i = 0; i < length; i++) {
+                    tunnel.push({ x: tx, y: ty, z: tz, r: 1.2 + Math.random() * 0.8 });
+                    tx += dx; ty += dy; tz += dz;
+                    dx += (Math.random() - 0.5) * 0.15;
+                    dy += (Math.random() - 0.5) * 0.08;
+                    dz += (Math.random() - 0.5) * 0.15;
+                    dx = Math.max(-1, Math.min(1, dx));
+                    dy = Math.max(-0.4, Math.min(0.2, dy));
+                    dz = Math.max(-1, Math.min(1, dz));
+                    if (ty > -2) { ty = -2; dy = -Math.abs(dy); }
+                    if (ty < -CAVE_DEPTH + 2) { ty = -CAVE_DEPTH + 2; dy = Math.abs(dy); }
+                }
+                caveTunnels.push(tunnel);
+            }
+
+            function isCave(x, y, z) {
+                if (y > 0) return false;
+                for (const tunnel of caveTunnels) {
+                    for (const point of tunnel) {
+                        const dist = Math.sqrt((x - point.x) ** 2 + (y - point.y) ** 2 * 2 + (z - point.z) ** 2);
+                        if (dist < point.r) return true;
+                    }
+                }
+                return false;
+            }
+
+            const caveEntrances = [];
+            for (let i = 0; i < 30; i++) {
+                const ex = Math.floor(Math.random() * SIZE * 1.5 - SIZE * 0.75);
+                const ez = Math.floor(Math.random() * SIZE * 1.5 - SIZE * 0.75);
+                if (Math.abs(ex) > 10 || Math.abs(ez) > 10) {
+                    caveEntrances.push({ x: ex, z: ez, r: 2 + Math.floor(Math.random() * 2) });
+                }
+            }
+
+            function isNearCaveEntrance(x, z) {
+                for (const e of caveEntrances) {
+                    const dist = Math.sqrt((x - e.x) ** 2 + (z - e.z) ** 2);
+                    if (dist < e.r) return true;
+                }
+                return false;
+            }
+
+            for (let x = -SIZE; x <= SIZE; x++) {
+                for (let z = -SIZE * 2; z <= SIZE; z++) {
+                    const isEntrance = isNearCaveEntrance(x, z);
+
+                    if (!isEntrance) {
+                        blocks.grass.push({x, y: 1, z});
+                        blocks.dirt.push({x, y: 0, z});
+                    }
+
+                    for (let y = -1; y >= -CAVE_DEPTH; y--) {
+                        if (isCave(x, y, z)) continue;
+                        if (isEntrance) {
+                            if (y > -10) continue;
+                            if (y > -12 && y <= -10) continue;
+                        }
+
+                        if (y > -3) {
+                            blocks.dirt.push({x, y, z});
+                        } else {
+                            blocks.stone.push({x, y, z});
+                        }
+                    }
+
+                    blocks.stone.push({x, y: -CAVE_DEPTH - 1, z});
+                }
+            }
+
+            for (let i = 0; i < 150; i++) {
+                const rx = Math.floor(Math.random() * SIZE * 2 - SIZE);
+                const rz = Math.floor(Math.random() * SIZE * 2 - SIZE);
+                if (Math.abs(rx) < 5 && Math.abs(rz) < 5) continue;
+                if (isNearCaveEntrance(rx, rz)) continue;
+                const distToLake = Math.sqrt((rx - LAKE_X) ** 2 + (rz - LAKE_Z) ** 2);
+                if (distToLake < LAKE_RADIUS + 5) continue;
+
+                const size = Math.random();
+                if (size < 0.6) {
+                    blocks.stone.push({x: rx, y: 2, z: rz});
+                } else if (size < 0.85) {
+                    blocks.stone.push({x: rx, y: 2, z: rz});
+                    blocks.stone.push({x: rx, y: 3, z: rz});
+                    if (Math.random() > 0.5) blocks.stone.push({x: rx + 1, y: 2, z: rz});
+                } else {
+                    for (let dx = 0; dx <= 1; dx++) {
+                        for (let dz = 0; dz <= 1; dz++) {
+                            blocks.stone.push({x: rx + dx, y: 2, z: rz + dz});
+                            if (Math.random() > 0.3) blocks.stone.push({x: rx + dx, y: 3, z: rz + dz});
+                        }
+                    }
+                    blocks.stone.push({x: rx, y: 4, z: rz});
+                }
+            }
+
+            const mountainPositions = [
+                { x: -60, z: -90, h: 25, w: 35 },
+                { x: 0, z: -100, h: 35, w: 40 },
+                { x: 50, z: -85, h: 28, w: 32 },
+                { x: -30, z: -120, h: 40, w: 45 },
+                { x: 40, z: -130, h: 38, w: 42 },
+                { x: -80, z: -110, h: 30, w: 35 },
+                { x: 80, z: -105, h: 32, w: 38 },
+            ];
+
+            mountainPositions.forEach(mt => {
+                for (let x = -mt.w; x <= mt.w; x++) {
+                    for (let z = -mt.w/2; z <= mt.w/2; z++) {
+                        const dist = Math.sqrt(x*x*0.8 + z*z*1.5);
+                        const h = Math.max(0, mt.h * (1 - dist / mt.w));
+                        if (h > 0) {
+                            const key = blockKey(Math.floor(mt.x + x), Math.floor(mt.z + z));
+                            solidBlocks.add(key);
+                            originalSolidBlocks.add(key);
+                        }
+                        for (let y = 0; y < h; y++) {
+                            if (y < h - 2) {
+                                blocks.stone.push({x: mt.x + x, y: y + 2, z: mt.z + z});
+                            } else {
+                                blocks.grass.push({x: mt.x + x, y: y + 2, z: mt.z + z});
+                            }
+                        }
+                    }
+                }
+            });
+
+            function isOverLake(x, z) {
+                const dist = Math.sqrt((x - LAKE_X) ** 2 + (z - LAKE_Z) ** 2);
+                return dist < LAKE_RADIUS + 3;
+            }
+
+            function isInLakeWater(x, z) {
+                const dist = Math.sqrt((x - LAKE_X) ** 2 + (z - LAKE_Z) ** 2);
+                return dist < LAKE_RADIUS;
+            }
+
+            for (let x = LAKE_X - LAKE_RADIUS - 2; x <= LAKE_X + LAKE_RADIUS + 2; x++) {
+                for (let z = LAKE_Z - LAKE_RADIUS - 2; z <= LAKE_Z + LAKE_RADIUS + 2; z++) {
+                    const dist = Math.sqrt((x - LAKE_X) ** 2 + (z - LAKE_Z) ** 2);
+
+                    if (dist < LAKE_RADIUS) {
+                        let idx = blocks.grass.findIndex(b => b.x === x && b.z === z && b.y === 1);
+                        if (idx >= 0) blocks.grass.splice(idx, 1);
+                        idx = blocks.dirt.findIndex(b => b.x === x && b.z === z && b.y === 0);
+                        if (idx >= 0) blocks.dirt.splice(idx, 1);
+                        blocks.sand.push({x, y: -1, z});
+                    }
+                    else if (dist < LAKE_RADIUS + 2) {
+                        let idx = blocks.grass.findIndex(b => b.x === x && b.z === z && b.y === 1);
+                        if (idx >= 0) blocks.grass.splice(idx, 1);
+                        blocks.sand.push({x, y: 1, z});
+                    }
+                }
+            }
+
+            mats.sand = new THREE.MeshStandardMaterial({ map: textures.sand(), roughness: 0.95 });
+
+            // ============================================================
+            // RTX-STYLE ВОДА С РЕАЛЬНЫМИ ОТРАЖЕНИЯМИ
+            // ============================================================
+            const waterGeo = new THREE.PlaneGeometry(LAKE_RADIUS * 2, LAKE_RADIUS * 2, 128, 128);
+
+            const waterMat = new THREE.ShaderMaterial({
+                uniforms: {
+                    uTime: { value: 0 },
+                    uSunDirection: { value: new THREE.Vector3(0.7, 0.3, 0.5).normalize() },
+                    uSunColor: { value: new THREE.Color(0xffeedd) },
+                    uWaterColor: { value: new THREE.Color(0x1a5070) },
+                    uWaterColorDeep: { value: new THREE.Color(0x0a2030) },
+                    // RTX-STYLE: Текстуры отражения и преломления
+                    tReflection: { value: reflectionRT.texture },
+                    tRefraction: { value: refractionRT.texture },
+                    uReflectionMatrix: { value: new THREE.Matrix4() }
+                },
+                vertexShader: `
+                    uniform float uTime;
+                    uniform mat4 uReflectionMatrix;
+
+                    varying vec3 vWorldPosition;
+                    varying vec3 vNormal;
+                    varying vec2 vUv;
+                    varying vec4 vReflectCoord;
+                    varying vec4 vRefractCoord;
+
+                    // GERSTNER WAVES - Физически корректные волны
+                    vec3 gerstnerWave(vec2 dir, float steepness, float wavelength, vec3 p, inout vec3 tan, inout vec3 bin) {
+                        float k = 6.28318 / wavelength;
+                        float c = sqrt(9.8 / k);
+                        vec2 d = normalize(dir);
+                        float f = k * (dot(d, p.xz) - c * uTime);
+                        float a = steepness / k;
+
+                        tan += vec3(-d.x * d.x * steepness * sin(f), d.x * steepness * cos(f), -d.x * d.y * steepness * sin(f));
+                        bin += vec3(-d.x * d.y * steepness * sin(f), d.y * steepness * cos(f), -d.y * d.y * steepness * sin(f));
+
+                        return vec3(d.x * a * cos(f), a * sin(f), d.y * a * cos(f));
+                    }
+
+                    void main() {
+                        vUv = uv;
+                        vec3 pos = position;
+
+                        vec3 tangent = vec3(1, 0, 0);
+                        vec3 binormal = vec3(0, 0, 1);
+
+                        // Множество волн для реализма
+                        pos += gerstnerWave(vec2(1.0, 0.3), 0.08, 8.0, pos, tangent, binormal);
+                        pos += gerstnerWave(vec2(-0.4, 1.0), 0.06, 5.0, pos, tangent, binormal);
+                        pos += gerstnerWave(vec2(0.8, 0.6), 0.04, 3.5, pos, tangent, binormal);
+                        pos += gerstnerWave(vec2(-0.6, 0.4), 0.025, 2.0, pos, tangent, binormal);
+                        pos += gerstnerWave(vec2(0.3, -0.8), 0.015, 1.2, pos, tangent, binormal);
+
+                        vNormal = normalize(cross(binormal, tangent));
+
+                        vec4 worldPos = modelMatrix * vec4(pos, 1.0);
+                        vWorldPosition = worldPos.xyz;
+
+                        // Координаты для текстур отражения/преломления
+                        vec4 clipPos = projectionMatrix * viewMatrix * worldPos;
+                        vReflectCoord = clipPos;
+                        vRefractCoord = clipPos;
+
+                        gl_Position = clipPos;
+                    }
+                `,
+                fragmentShader: `
+                    precision highp float;
+
+                    uniform float uTime;
+                    uniform vec3 uSunDirection;
+                    uniform vec3 uSunColor;
+                    uniform vec3 uWaterColor;
+                    uniform vec3 uWaterColorDeep;
+                    uniform sampler2D tReflection;
+                    uniform sampler2D tRefraction;
+
+                    varying vec3 vWorldPosition;
+                    varying vec3 vNormal;
+                    varying vec2 vUv;
+                    varying vec4 vReflectCoord;
+                    varying vec4 vRefractCoord;
+
+                    // Noise
+                    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+                    float noise(vec2 p) {
+                        vec2 i = floor(p), f = fract(p);
+                        f = f * f * (3.0 - 2.0 * f);
+                        return mix(mix(hash(i), hash(i + vec2(1,0)), f.x),
+                                   mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y);
+                    }
+
+                    float fbm(vec2 p) {
+                        float v = 0.0, a = 0.5;
+                        for(int i = 0; i < 5; i++) { v += a * noise(p); p *= 2.0; a *= 0.5; }
+                        return v;
+                    }
+
+                    void main() {
+                        vec3 viewDir = normalize(cameraPosition - vWorldPosition);
+                        vec3 normal = normalize(vNormal);
+
+                        // Detail normal mapping
+                        vec2 uv1 = vWorldPosition.xz * 0.5 + uTime * vec2(0.02, 0.015);
+                        vec2 uv2 = vWorldPosition.xz * 0.8 - uTime * vec2(0.018, 0.02);
+                        float n1 = noise(uv1 * 12.0);
+                        float n2 = noise(uv2 * 18.0);
+                        vec3 detailN = normalize(vec3(
+                            (noise(uv1 * 12.0 + vec2(0.1, 0)) - n1) + (noise(uv2 * 18.0 + vec2(0.1, 0)) - n2),
+                            1.0,
+                            (noise(uv1 * 12.0 + vec2(0, 0.1)) - n1) + (noise(uv2 * 18.0 + vec2(0, 0.1)) - n2)
+                        ));
+                        normal = normalize(normal + detailN * 0.12);
+
+                        // FRESNEL - ключ к реализму!
+                        float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 4.0);
+                        fresnel = clamp(fresnel, 0.02, 0.98);
+
+                        // Screen-space UV для текстур
+                        vec2 screenUV = vReflectCoord.xy / vReflectCoord.w * 0.5 + 0.5;
+
+                        // Искажение от нормалей (как преломление)
+                        vec2 distortion = normal.xz * 0.03;
+
+                        // === REFLECTION (отражение) ===
+                        vec2 reflectUV = vec2(screenUV.x, 1.0 - screenUV.y) + distortion;
+                        reflectUV = clamp(reflectUV, 0.001, 0.999);
+                        vec3 reflectionColor = texture2D(tReflection, reflectUV).rgb;
+
+                        // Улучшаем отражение добавлением неба
+                        vec3 reflectDir = reflect(-viewDir, normal);
+                        float skyMix = smoothstep(-0.1, 0.5, reflectDir.y);
+                        vec3 skyReflect = mix(
+                            vec3(0.7, 0.75, 0.8),   // Горизонт
+                            vec3(0.4, 0.55, 0.75),  // Небо
+                            skyMix
+                        );
+                        // Добавляем солнце в отражении
+                        float sunReflect = pow(max(dot(reflectDir, uSunDirection), 0.0), 256.0);
+                        skyReflect += uSunColor * sunReflect * 3.0;
+
+                        reflectionColor = mix(reflectionColor, skyReflect, 0.4);
+
+                        // === REFRACTION (преломление/подводный мир) ===
+                        vec2 refractUV = screenUV + distortion * 1.5;
+                        refractUV = clamp(refractUV, 0.001, 0.999);
+                        vec3 refractionColor = texture2D(tRefraction, refractUV).rgb;
+
+                        // Затухание цвета с глубиной (Beer's Law)
+                        float depthFade = 1.0 - exp(-length(vWorldPosition - cameraPosition) * 0.02);
+                        refractionColor = mix(refractionColor, uWaterColorDeep, depthFade * 0.6);
+
+                        // Добавляем КАУСТИКУ на дно
+                        vec2 causticUV = vWorldPosition.xz * 0.3;
+                        float c1 = noise(causticUV * 5.0 + uTime * 0.4);
+                        float c2 = noise(causticUV * 7.0 - uTime * 0.3);
+                        float caustics = pow(c1 * c2, 1.5) * 2.0;
+                        refractionColor += uSunColor * caustics * 0.3 * (1.0 - fresnel);
+
+                        // === SPECULAR (блики солнца) ===
+                        vec3 H = normalize(viewDir + uSunDirection);
+                        float spec = pow(max(dot(normal, H), 0.0), 512.0) * 2.0;
+                        spec += pow(max(dot(normal, H), 0.0), 64.0) * 0.5;
+
+                        // Искры на воде
+                        float sparkle = noise(vWorldPosition.xz * 10.0 + uTime * 3.0);
+                        sparkle = pow(sparkle, 20.0) * 5.0 * max(dot(normal, uSunDirection), 0.0);
+                        spec += sparkle;
+
+                        // === FOAM (пена) ===
+                        float waveH = vWorldPosition.y;
+                        float foam = smoothstep(0.1, 0.25, waveH) * fbm(vWorldPosition.xz * 5.0 + uTime * 0.2);
+                        foam = pow(foam, 1.2) * 0.7;
+
+                        // === SSS (свет сквозь волну) ===
+                        float sss = pow(max(dot(viewDir, -uSunDirection), 0.0), 3.0);
+                        sss *= pow(1.0 - abs(dot(normal, viewDir)), 1.5);
+                        vec3 sssColor = vec3(0.1, 0.5, 0.4) * sss * 0.5;
+
+                        // === FINAL MIX ===
+                        // Смешиваем refraction и reflection по Френелю
+                        vec3 color = mix(refractionColor, reflectionColor, fresnel);
+
+                        // Добавляем базовый цвет воды
+                        color = mix(color, uWaterColor, 0.15);
+
+                        // SSS
+                        color += sssColor;
+
+                        // Блики
+                        color += uSunColor * spec;
+
+                        // Пена
+                        color = mix(color, vec3(1.0), foam);
+
+                        // Прозрачность
+                        float alpha = mix(0.85, 0.98, fresnel);
+                        alpha = mix(alpha, 1.0, foam);
+
+                        gl_FragColor = vec4(color, alpha);
+                    }
+                `,
+                transparent: true,
+                side: THREE.DoubleSide,
+                depthWrite: false
+            });
+
+            waterMesh = new THREE.Mesh(waterGeo, waterMat);
+            waterMesh.rotation.x = -Math.PI / 2;
+            waterMesh.position.set(LAKE_X, 0.3, LAKE_Z);
+            scene.add(waterMesh);
+
+            window.waterMesh = waterMesh;
+
+            function addOakTree(tx, tz) {
+                const key = blockKey(tx, tz);
+                solidBlocks.add(key);
+                originalSolidBlocks.add(key);
+                const h = 5 + Math.floor(Math.random() * 4);
+                for (let y = 2; y <= h + 2; y++) blocks.bark.push({x: tx, y, z: tz});
+
+                for (let dx = -3; dx <= 3; dx++) {
+                    for (let dz = -3; dz <= 3; dz++) {
+                        for (let dy = 0; dy <= 3; dy++) {
+                            const dist = Math.sqrt(dx*dx + dz*dz + dy*dy);
+                            if (dist <= 3.5 - dy * 0.3) {
+                                blocks.leaves.push({x: tx+dx, y: h+dy, z: tz+dz});
+                            }
+                        }
+                    }
+                }
+            }
+
+            function addTallTree(tx, tz) {
+                const key = blockKey(tx, tz);
+                solidBlocks.add(key);
+                originalSolidBlocks.add(key);
+                const h = 10 + Math.floor(Math.random() * 6);
+                for (let y = 2; y <= h + 3; y++) blocks.bark.push({x: tx, y, z: tz});
+
+                for (let layer = 0; layer < 5; layer++) {
+                    const r = 3 - layer * 0.5;
+                    const ly = h - 2 + layer;
+                    for (let dx = -r; dx <= r; dx++) {
+                        for (let dz = -r; dz <= r; dz++) {
+                            if (Math.abs(dx) + Math.abs(dz) <= r + 1) {
+                                blocks.leaves.push({x: tx+dx, y: ly, z: tz+dz});
+                            }
+                        }
+                    }
+                }
+            }
+
+            function addBirchTree(tx, tz) {
+                const key = blockKey(tx, tz);
+                solidBlocks.add(key);
+                originalSolidBlocks.add(key);
+                const h = 6 + Math.floor(Math.random() * 3);
+                for (let y = 2; y <= h + 1; y++) blocks.bark.push({x: tx, y, z: tz});
+
+                for (let dx = -2; dx <= 2; dx++) {
+                    for (let dz = -2; dz <= 2; dz++) {
+                        if (Math.abs(dx) + Math.abs(dz) <= 3) {
+                            blocks.leaves.push({x: tx+dx, y: h, z: tz+dz});
+                            blocks.leaves.push({x: tx+dx, y: h+1, z: tz+dz});
+                            if (Math.abs(dx) + Math.abs(dz) <= 1) {
+                                blocks.leaves.push({x: tx+dx, y: h+2, z: tz+dz});
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (let i = 0; i < 200; i++) {
+                let tx, tz;
+                do {
+                    tx = Math.floor(Math.random() * SIZE * 2 - SIZE);
+                    tz = Math.floor(Math.random() * SIZE * 2 - SIZE);
+                } while ((Math.abs(tx) < 6 && Math.abs(tz) < 6) || isOverLake(tx, tz));
+
+                const type = Math.random();
+                if (type < 0.4) addOakTree(tx, tz);
+                else if (type < 0.7) addTallTree(tx, tz);
+                else addBirchTree(tx, tz);
+            }
+
+            for (let i = 0; i < 100; i++) {
+                const bx = Math.floor(Math.random() * SIZE * 2 - SIZE);
+                const bz = Math.floor(Math.random() * SIZE * 2 - SIZE);
+                if (isOverLake(bx, bz)) continue;
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        if (Math.random() > 0.3) {
+                            blocks.leaves.push({x: bx+dx, y: 2, z: bz+dz});
+                        }
+                    }
+                }
+            }
+
+            Object.keys(blocks).forEach(type => {
+                if (blocks[type].length === 0) return;
+                const mesh = new THREE.InstancedMesh(geo, mats[type], blocks[type].length);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                const m = new THREE.Matrix4();
+                blocks[type].forEach((b, i) => {
+                    m.setPosition(b.x + 0.5, b.y + 0.5, b.z + 0.5);
+                    mesh.setMatrixAt(i, m);
+                    const key = blockKey3D(b.x, b.y, b.z);
+                    generatedBlocks.set(key, { type, instanceIndex: i, mesh, x: b.x, y: b.y, z: b.z });
+                });
+                scene.add(mesh);
+            });
+
+            function addDecoration(mesh, blockX, blockZ) {
+                const key = blockKey(blockX, blockZ);
+                if (!decorations.has(key)) {
+                    decorations.set(key, []);
+                }
+                decorations.get(key).push(mesh);
+                scene.add(mesh);
+            }
+
+            const grassColors = [0x5a8a3a, 0x6a9a4a, 0x7aaa5a, 0x8aba6a, 0x5a9040, 0x6aa050, 0x4a8030];
+            for (let i = 0; i < 4000; i++) {
+                const gx = Math.random() * SIZE * 2 - SIZE;
+                const gz = Math.random() * SIZE * 2 - SIZE;
+                const blockX = Math.floor(gx);
+                const blockZ = Math.floor(gz);
+
+                if (isNearCaveEntrance(blockX, blockZ)) continue;
+                if (isOverLake(blockX, blockZ)) continue;
+
+                const tuftType = Math.random();
+                const bladesCount = tuftType < 0.3 ? 5 : tuftType < 0.7 ? 4 : 3;
+                const baseHeight = tuftType < 0.3 ? 0.6 : tuftType < 0.6 ? 0.4 : 0.3;
+
+                for (let j = 0; j < bladesCount; j++) {
+                    const height = baseHeight + Math.random() * 0.4;
+                    const bladeGeo = new THREE.PlaneGeometry(0.08 + Math.random() * 0.08, height);
+                    const bladeMat = new THREE.MeshStandardMaterial({
+                        color: grassColors[Math.floor(Math.random() * grassColors.length)],
+                        roughness: 0.85,
+                        side: THREE.DoubleSide
+                    });
+                    const blade = new THREE.Mesh(bladeGeo, bladeMat);
+                    const offsetDist = Math.random() * 0.25;
+                    const offsetAngle = Math.random() * Math.PI * 2;
+                    blade.position.set(
+                        gx + Math.cos(offsetAngle) * offsetDist,
+                        2 + height / 2,
+                        gz + Math.sin(offsetAngle) * offsetDist
+                    );
+                    blade.rotation.y = Math.random() * Math.PI;
+                    blade.rotation.x = (Math.random() - 0.5) * 0.3;
+                    blade.rotation.z = (Math.random() - 0.5) * 0.15;
+                    addDecoration(blade, blockX, blockZ);
+                }
+            }
+
+            const flowerColors = [0xff6b6b, 0xffd93d, 0xffffff, 0xc77dff, 0xff9ecd];
+            for (let i = 0; i < 200; i++) {
+                const fx = Math.random() * SIZE * 2 - SIZE;
+                const fz = Math.random() * SIZE * 2 - SIZE;
+                const blockX = Math.floor(fx);
+                const blockZ = Math.floor(fz);
+
+                if (isNearCaveEntrance(blockX, blockZ)) continue;
+                if (isOverLake(blockX, blockZ)) continue;
+
+                const flowerColor = flowerColors[Math.floor(Math.random() * flowerColors.length)];
+                const stemHeight = 0.5 + Math.random() * 0.3;
+                const rotY = Math.random() * Math.PI;
+
+                const stemGeo = new THREE.PlaneGeometry(0.06, stemHeight);
+                const stemMat = new THREE.MeshStandardMaterial({
+                    color: 0x4a8030,
+                    roughness: 0.8,
+                    side: THREE.DoubleSide
+                });
+                const stem = new THREE.Mesh(stemGeo, stemMat);
+                stem.position.set(fx, 2 + stemHeight / 2, fz);
+                stem.rotation.y = rotY;
+                addDecoration(stem, blockX, blockZ);
+
+                for (let p = 0; p < 2; p++) {
+                    const petalGeo = new THREE.PlaneGeometry(0.12, 0.12);
+                    const petalMat = new THREE.MeshStandardMaterial({
+                        color: flowerColor,
+                        roughness: 0.6,
+                        side: THREE.DoubleSide
+                    });
+                    const petal = new THREE.Mesh(petalGeo, petalMat);
+                    petal.position.set(fx, 2 + stemHeight + 0.05, fz);
+                    petal.rotation.y = rotY + p * Math.PI / 2;
+                    addDecoration(petal, blockX, blockZ);
+                }
+            }
+
+            for (let i = 0; i < 200; i++) {
+                const fx = Math.random() * SIZE * 2 - SIZE;
+                const fz = Math.random() * SIZE * 2 - SIZE;
+                const blockX = Math.floor(fx);
+                const blockZ = Math.floor(fz);
+
+                if (isNearCaveEntrance(blockX, blockZ)) continue;
+                if (isOverLake(blockX, blockZ)) continue;
+
+                for (let f = 0; f < 6; f++) {
+                    const fernGeo = new THREE.PlaneGeometry(0.6, 0.5);
+                    const fernMat = new THREE.MeshStandardMaterial({
+                        color: 0x4a8a3a,
+                        roughness: 0.7,
+                        side: THREE.DoubleSide
+                    });
+                    const fern = new THREE.Mesh(fernGeo, fernMat);
+                    const angle = (f / 6) * Math.PI * 2;
+                    fern.position.set(
+                        fx + Math.cos(angle) * 0.2,
+                        2.3,
+                        fz + Math.sin(angle) * 0.2
+                    );
+                    fern.rotation.y = angle + Math.PI / 2;
+                    fern.rotation.x = -0.5;
+                    addDecoration(fern, blockX, blockZ);
+                }
+            }
+        }
+
+        const placeMats = {
+            grass: new THREE.MeshStandardMaterial({ map: textures.grass(), roughness: 0.9 }),
+            dirt: new THREE.MeshStandardMaterial({ map: textures.dirt(), roughness: 1 }),
+            stone: new THREE.MeshStandardMaterial({ map: textures.stone(), roughness: 0.9 }),
+            bark: new THREE.MeshStandardMaterial({ map: textures.bark(), roughness: 0.8 }),
+            leaves: new THREE.MeshStandardMaterial({ map: textures.leaves(), roughness: 0.7 })
+        };
+        const placeGeo = new THREE.BoxGeometry(1, 1, 1);
+
+        function blockKey3D(x, y, z) { return x + ',' + y + ',' + z; }
+
+        function placeBlock(x, y, z, type) {
+            const key = blockKey3D(x, y, z);
+            if (worldBlocks.has(key)) return;
+            if (generatedBlocks.has(key) && !destroyedBlocks.has(key)) return;
+
+            const mesh = new THREE.Mesh(placeGeo, placeMats[type]);
+            mesh.position.set(x + 0.5, y + 0.5, z + 0.5);
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+
+            worldBlocks.set(key, { mesh, type, x, y, z });
+        }
+
+        const blockColors = {
+            grass: [0x4a7c34, 0x3a6c24, 0x5a8c44],
+            dirt: [0x6b4a2a, 0x5b3a1a, 0x7b5a3a],
+            stone: [0x7a7a7a, 0x6a6a6a, 0x8a8a8a],
+            bark: [0x3a2a1a, 0x2a1a0a, 0x4a3a2a],
+            leaves: [0x4a8a3a, 0x3a7a2a, 0x5a9a4a],
+            sand: [0xc4b090, 0xd4c0a0, 0xb4a080]
+        };
+
+        function spawnParticles(x, y, z, type) {
+            const colors = blockColors[type] || blockColors.dirt;
+            const centerX = x + 0.5;
+            const centerY = y + 0.5;
+            const centerZ = z + 0.5;
+
+            const count = 12 + Math.floor(Math.random() * 8);
+            for (let i = 0; i < count; i++) {
+                const color = colors[Math.floor(Math.random() * colors.length)];
+                const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.9 });
+                const particle = new THREE.Mesh(particleGeo, mat);
+
+                particle.position.set(
+                    centerX + (Math.random() - 0.5) * 0.8,
+                    centerY + (Math.random() - 0.5) * 0.8,
+                    centerZ + (Math.random() - 0.5) * 0.8
+                );
+
+                particle.rotation.set(
+                    Math.random() * Math.PI,
+                    Math.random() * Math.PI,
+                    Math.random() * Math.PI
+                );
+
+                particle.userData.velocity = new THREE.Vector3(
+                    (Math.random() - 0.5) * 8,
+                    Math.random() * 6 + 2,
+                    (Math.random() - 0.5) * 8
+                );
+                particle.userData.rotSpeed = new THREE.Vector3(
+                    (Math.random() - 0.5) * 10,
+                    (Math.random() - 0.5) * 10,
+                    (Math.random() - 0.5) * 10
+                );
+                particle.userData.life = 1.5 + Math.random() * 0.5;
+                particle.userData.scale = 0.8 + Math.random() * 0.4;
+                particle.scale.setScalar(particle.userData.scale);
+
+                scene.add(particle);
+                particles.push(particle);
+            }
+        }
+
+        function updateParticles(dt) {
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.userData.life -= dt;
+
+                if (p.userData.life <= 0) {
+                    scene.remove(p);
+                    particles.splice(i, 1);
+                    continue;
+                }
+
+                p.userData.velocity.y -= 25 * dt;
+                p.position.add(p.userData.velocity.clone().multiplyScalar(dt));
+
+                p.rotation.x += p.userData.rotSpeed.x * dt;
+                p.rotation.y += p.userData.rotSpeed.y * dt;
+                p.rotation.z += p.userData.rotSpeed.z * dt;
+
+                const particleGround = getGroundLevelAt(p.position.x, p.position.z) + 0.1;
+                if (p.position.y < particleGround) {
+                    p.position.y = particleGround;
+                    p.userData.velocity.y *= -0.4;
+                    p.userData.velocity.x *= 0.7;
+                    p.userData.velocity.z *= 0.7;
+                }
+
+                if (p.userData.life < 0.5) {
+                    const scale = (p.userData.life / 0.5) * p.userData.scale;
+                    p.scale.setScalar(scale);
+                }
+            }
+        }
+
+        function destroyBlock(x, y, z, type) {
+            const key = blockKey3D(x, y, z);
+            const key2D = blockKey(x, z);
+
+            spawnParticles(x, y, z, type || 'dirt');
+
+            const block = worldBlocks.get(key);
+            if (block) {
+                scene.remove(block.mesh);
+                worldBlocks.delete(key);
+            }
+
+            const genBlock = generatedBlocks.get(key);
+            if (genBlock && !destroyedBlocks.has(key)) {
+                destroyedBlocks.add(key);
+                const m = new THREE.Matrix4();
+                m.setPosition(10000, 10000, 10000);
+                genBlock.mesh.setMatrixAt(genBlock.instanceIndex, m);
+                genBlock.mesh.instanceMatrix.needsUpdate = true;
+            }
+
+            if (y === 1 && decorations.has(key2D)) {
+                const decos = decorations.get(key2D);
+                decos.forEach(mesh => {
+                    scene.remove(mesh);
+                });
+                decorations.delete(key2D);
+            }
+
+            if (originalSolidBlocks.has(key2D)) {
+                let hasTrunkBlocks = false;
+                for (let checkY = 2; checkY <= 50; checkY++) {
+                    const checkKey = blockKey3D(x, checkY, z);
+                    const genB = generatedBlocks.get(checkKey);
+                    if (genB && !destroyedBlocks.has(checkKey) && (genB.type === 'bark' || genB.type === 'stone')) {
+                        hasTrunkBlocks = true;
+                        break;
+                    }
+                }
+                if (!hasTrunkBlocks) {
+                    solidBlocks.delete(key2D);
+                }
+            }
+        }
+
+        function canMoveTo(x, z, playerY) {
+            const r = 0.35;
+            const feetY = playerY - PLAYER_HEIGHT;
+            const headY = playerY - 0.3;
+
+            for (let bx = Math.floor(x-r); bx <= Math.floor(x+r); bx++) {
+                for (let bz = Math.floor(z-r); bz <= Math.floor(z+r); bz++) {
+                    if (playerY > 2 && solidBlocks.has(blockKey(bx, bz))) return false;
+
+                    for (let by = Math.floor(feetY); by <= Math.floor(headY); by++) {
+                        if (hasBlockAt(bx, by, bz)) return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        function hasBlockAt(x, y, z) {
+            const key = blockKey3D(x, y, z);
+            if (generatedBlocks.has(key) && !destroyedBlocks.has(key)) return true;
+            if (worldBlocks.has(key)) return true;
+            return false;
+        }
+
+        function getGroundLevelAt(x, z) {
+            const bx = Math.floor(x);
+            const bz = Math.floor(z);
+            for (let y = 50; y >= -CAVE_DEPTH - 1; y--) {
+                if (hasBlockAt(bx, y, bz)) {
+                    return y + 1;
+                }
+            }
+            return -CAVE_DEPTH;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const now = performance.now();
+            const dt = Math.min((now - prevTime) / 1000, 0.05);
+            prevTime = now;
+
+            // FPS счётчик
+            fpsFrames++;
+            if (now - fpsTime >= 1000) {
+                document.getElementById('fpsVal').textContent = fpsFrames;
+                fpsFrames = 0;
+                fpsTime = now;
+            }
+
+            if (isLocked) {
+                const dir = new THREE.Vector3();
+                if (moveForward) dir.z -= 1;
+                if (moveBackward) dir.z += 1;
+                if (moveLeft) dir.x -= 1;
+                if (moveRight) dir.x += 1;
+
+                if (dir.length() > 0) {
+                    dir.normalize().applyAxisAngle(new THREE.Vector3(0,1,0), yaw).multiplyScalar(5 * dt);
+                    const nx = camera.position.x + dir.x;
+                    const nz = camera.position.z + dir.z;
+                    const py = camera.position.y;
+                    if (canMoveTo(nx, nz, py)) { camera.position.x = nx; camera.position.z = nz; }
+                    else if (canMoveTo(nx, camera.position.z, py)) camera.position.x = nx;
+                    else if (canMoveTo(camera.position.x, nz, py)) camera.position.z = nz;
+                }
+
+                velocityY -= GRAVITY * dt;
+                let newY = camera.position.y + velocityY * dt;
+
+                const bx = Math.floor(camera.position.x);
+                const bz = Math.floor(camera.position.z);
+
+                function isPlayerStuck(eyeY) {
+                    const feetY = eyeY - PLAYER_HEIGHT;
+                    const headY = eyeY - 0.2;
+                    const r = 0.3;
+                    for (let cbx = Math.floor(camera.position.x - r); cbx <= Math.floor(camera.position.x + r); cbx++) {
+                        for (let cbz = Math.floor(camera.position.z - r); cbz <= Math.floor(camera.position.z + r); cbz++) {
+                            for (let cy = Math.floor(feetY); cy <= Math.floor(headY); cy++) {
+                                if (hasBlockAt(cbx, cy, cbz)) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    return false;
+                }
+
+                function findGround(eyeY) {
+                    const feetY = eyeY - PLAYER_HEIGHT;
+                    for (let checkY = Math.floor(feetY); checkY >= -CAVE_DEPTH - 1; checkY--) {
+                        if (hasBlockAt(bx, checkY, bz)) {
+                            return checkY + 1 + PLAYER_HEIGHT;
+                        }
+                    }
+                    return -CAVE_DEPTH + PLAYER_HEIGHT;
+                }
+
+                if (isPlayerStuck(camera.position.y)) {
+                    for (let testY = Math.floor(camera.position.y - PLAYER_HEIGHT); testY < 60; testY++) {
+                        const testEyeY = testY + 1 + PLAYER_HEIGHT;
+                        if (!isPlayerStuck(testEyeY)) {
+                            camera.position.y = testEyeY;
+                            velocityY = 0;
+                            break;
+                        }
+                    }
+                }
+
+                const groundLevel = findGround(newY);
+
+                if (newY <= groundLevel) {
+                    newY = groundLevel;
+                    velocityY = 0;
+                    onGround = true;
+                } else {
+                    onGround = false;
+                }
+
+                if (velocityY > 0) {
+                    const headBlockY = Math.floor(newY);
+                    if (hasBlockAt(bx, headBlockY, bz)) {
+                        newY = headBlockY - 0.1;
+                        velocityY = -1;
+                    }
+                }
+
+                if (!isPlayerStuck(newY)) {
+                    camera.position.y = newY;
+                } else {
+                    velocityY = 0;
+                    onGround = true;
+                }
+
+                if (camera.position.y < -CAVE_DEPTH + PLAYER_HEIGHT) {
+                    camera.position.y = -CAVE_DEPTH + PLAYER_HEIGHT;
+                    velocityY = 0;
+                    onGround = true;
+                }
+
+                raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+                const rayDir = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+
+                let closestHit = null;
+                let closestDist = Infinity;
+                let hitBlockType = null;
+                let canDestroy = false;
+
+                worldBlocks.forEach((block, key) => {
+                    const intersects = raycaster.intersectObject(block.mesh);
+                    if (intersects.length > 0 && intersects[0].distance < closestDist) {
+                        closestDist = intersects[0].distance;
+                        closestHit = {
+                            block: block,
+                            point: intersects[0].point,
+                            face: intersects[0].face
+                        };
+                        hitBlockType = block.type;
+                        canDestroy = true;
+                    }
+                });
+
+                const stepSize = 0.1;
+                for (let t = 0; t < raycaster.far && t < closestDist; t += stepSize) {
+                    const px = camera.position.x + rayDir.x * t;
+                    const py = camera.position.y + rayDir.y * t;
+                    const pz = camera.position.z + rayDir.z * t;
+
+                    const bx = Math.floor(px);
+                    const by = Math.floor(py);
+                    const bz = Math.floor(pz);
+                    const key = blockKey3D(bx, by, bz);
+
+                    if (generatedBlocks.has(key) && !destroyedBlocks.has(key)) {
+                        const genBlock = generatedBlocks.get(key);
+                        closestDist = t;
+                        closestHit = {
+                            block: { x: bx, y: by, z: bz },
+                            point: new THREE.Vector3(px, py, pz),
+                            face: { normal: new THREE.Vector3(0, 1, 0) }
+                        };
+                        hitBlockType = genBlock.type;
+                        canDestroy = true;
+
+                        const fx = px - (bx + 0.5);
+                        const fy = py - (by + 0.5);
+                        const fz = pz - (bz + 0.5);
+                        const ax = Math.abs(fx), ay = Math.abs(fy), az = Math.abs(fz);
+                        if (ax > ay && ax > az) closestHit.face.normal.set(fx > 0 ? 1 : -1, 0, 0);
+                        else if (ay > az) closestHit.face.normal.set(0, fy > 0 ? 1 : -1, 0);
+                        else closestHit.face.normal.set(0, 0, fz > 0 ? 1 : -1);
+
+                        break;
+                    }
+                }
+
+                if (closestHit) {
+                    targetBlock = {
+                        x: closestHit.block.x,
+                        y: closestHit.block.y,
+                        z: closestHit.block.z,
+                        canDestroy: canDestroy,
+                        blockType: hitBlockType
+                    };
+
+                    const normal = closestHit.face.normal;
+                    targetFace = { x: Math.round(normal.x), y: Math.round(normal.y), z: Math.round(normal.z) };
+
+                    highlightBox.position.set(targetBlock.x + 0.5, targetBlock.y + 0.5, targetBlock.z + 0.5);
+                    highlightBox.visible = true;
+                } else {
+                    targetBlock = null;
+                    targetFace = null;
+                    highlightBox.visible = false;
+                }
+            } else {
+                highlightBox.visible = false;
+            }
+
+            updateParticles(dt);
+
+            // ============================================================
+            // RTX-STYLE: Рендеринг отражений и преломлений воды
+            // ============================================================
+            if (waterMesh && waterMesh.material.uniforms) {
+                waterMesh.material.uniforms.uTime.value += dt;
+                waterMesh.material.uniforms.uSunDirection.value.set(0.7, 0.3, 0.5).normalize();
+
+                const waterY = waterMesh.position.y;
+
+                // 1. REFRACTION (преломление - что под водой)
+                waterMesh.visible = false;
+                renderer.setRenderTarget(refractionRT);
+                renderer.render(scene, camera);
+
+                // 2. REFLECTION (отражение - зеркальная камера)
+                reflectionCamera.copy(camera);
+                reflectionCamera.position.y = -camera.position.y + 2 * waterY;
+                reflectionCamera.rotation.x = -camera.rotation.x;
+                reflectionCamera.updateProjectionMatrix();
+
+                renderer.setRenderTarget(reflectionRT);
+                renderer.render(scene, reflectionCamera);
+
+                // Возвращаем нормальный рендер
+                renderer.setRenderTarget(null);
+                waterMesh.visible = true;
+            }
+
+            // === Рендерим через composer с Post-Processing ===
+            composer.render();
+        }
+
+        init();
+        animate();
+    </script>
+</body>
+</html>
